@@ -8,6 +8,10 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, Form, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, RedirectResponse
+from dotenv import load_dotenv
+
+# Load environment variables from .env file for local execution
+load_dotenv()
 
 app = FastAPI(title="NIFTY 100 Swing Trader")
 
@@ -27,6 +31,8 @@ NIFTY_100_TICKERS = [
 # HELPERS
 # ==========================================
 def get_db_connection():
+    if not DATABASE_URL:
+        raise Exception("DATABASE_URL is not set!")
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 def send_telegram_alert(message: str):
@@ -45,20 +51,26 @@ def send_telegram_alert(message: str):
 # ==========================================
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
-    conn = get_db_connection()
-    cur = conn.cursor()
-    
-    # Get Portfolio
-    cur.execute("SELECT * FROM portfolio LIMIT 1;")
-    portfolio = cur.fetchone()
-    if not portfolio:
-        return "Database not initialized. Please run setup_db.py."
-    
-    # Get Active Positions
-    cur.execute("SELECT * FROM positions WHERE status = 'active' ORDER BY entry_date DESC;")
-    positions = cur.fetchall()
-    
-    conn.close()
+    if not DATABASE_URL:
+        return "<h3>Error: DATABASE_URL is missing. Please check your .env file.</h3>"
+        
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Get Portfolio
+        cur.execute("SELECT * FROM portfolio LIMIT 1;")
+        portfolio = cur.fetchone()
+        if not portfolio:
+            return "Database not initialized. Please run setup_db.py."
+        
+        # Get Active Positions
+        cur.execute("SELECT * FROM positions WHERE status = 'active' ORDER BY entry_date DESC;")
+        positions = cur.fetchall()
+        
+        conn.close()
+    except Exception as e:
+        return f"<h3>Database Connection Error:</h3><p>{e}</p>"
     
     # Basic HTML UI
     html = f"""
@@ -182,10 +194,11 @@ def close_position_ui(position_id: int = Form(...), exit_price: float = Form(...
     cur.execute("SELECT * FROM positions WHERE id = %s AND status = 'active';", (position_id,))
     pos = cur.fetchone()
     if pos:
+        entry_price = float(pos['entry_price'])
         sell_value = (pos['quantity'] * exit_price) - 40
-        buy_cost = (pos['quantity'] * pos['entry_price']) + 35
+        buy_cost = (pos['quantity'] * entry_price) + 35
         profit = sell_value - buy_cost
-        ret_pct = ((exit_price / pos['entry_price']) - 1) * 100
+        ret_pct = ((exit_price / entry_price) - 1) * 100
         
         # Add to available capital
         cur.execute("UPDATE portfolio SET available_capital = available_capital + %s WHERE id = 1;", (sell_value,))
@@ -195,7 +208,7 @@ def close_position_ui(position_id: int = Form(...), exit_price: float = Form(...
         cur.execute("""
             INSERT INTO trade_history (ticker, strategy, entry_date, exit_date, entry_price, exit_price, quantity, profit_loss, return_pct, reason)
             VALUES (%s, %s, %s, CURRENT_DATE, %s, %s, %s, %s, %s, %s)
-        """, (pos['ticker'], pos['strategy'], pos['entry_date'], pos['entry_price'], exit_price, pos['quantity'], profit, ret_pct, reason))
+        """, (pos['ticker'], pos['strategy'], pos['entry_date'], entry_price, exit_price, pos['quantity'], profit, ret_pct, reason))
         
     conn.commit()
     conn.close()
@@ -216,7 +229,6 @@ def check_exits():
     
     for pos in positions:
         ticker = pos['ticker']
-        # Get today's daily data. yfinance returns live day's data if requested during market hours.
         try:
             df = yf.download(ticker, period="1d", progress=False)
             if df.empty:
@@ -225,47 +237,47 @@ def check_exits():
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
                 
-            today_high = df['High'].iloc[-1]
-            today_low = df['Low'].iloc[-1]
-            today_close = df['Close'].iloc[-1]
+            today_high = float(df['High'].iloc[-1])
+            today_low = float(df['Low'].iloc[-1])
+            today_close = float(df['Close'].iloc[-1])
+            
+            sl_price = float(pos['sl_price'])
+            target_price = float(pos['target_price'])
+            entry_price = float(pos['entry_price'])
             
             exit_triggered = False
             exit_reason = ""
             exit_price = 0.0
             
-            # Logic exactly matching the Jupyter Notebook backtest
-            if today_low <= pos['sl_price']:
+            if today_low <= sl_price:
                 exit_triggered = True
                 exit_reason = "Stop Loss (1.5x ATR)"
-                exit_price = pos['sl_price']
-            elif today_high >= pos['target_price']:
+                exit_price = sl_price
+            elif today_high >= target_price:
                 exit_triggered = True
                 exit_reason = "Target Hit (1:2 RR)"
-                exit_price = pos['target_price']
+                exit_price = target_price
             elif pos['bars_held'] >= 20:
                 exit_triggered = True
                 exit_reason = "Time Exit (20 Days)"
                 exit_price = today_close
                 
             if exit_triggered:
-                # Calculate financials
                 sell_value = (pos['quantity'] * exit_price) - 40
-                buy_cost = (pos['quantity'] * pos['entry_price']) + 35
+                buy_cost = (pos['quantity'] * entry_price) + 35
                 profit = sell_value - buy_cost
-                ret_pct = ((exit_price / pos['entry_price']) - 1) * 100
+                ret_pct = ((exit_price / entry_price) - 1) * 100
                 
-                # Execute exit in DB
                 cur.execute("UPDATE portfolio SET available_capital = available_capital + %s WHERE id = 1;", (sell_value,))
                 cur.execute("UPDATE positions SET status = 'closed' WHERE id = %s;", (pos['id'],))
                 cur.execute("""
                     INSERT INTO trade_history (ticker, strategy, entry_date, exit_date, entry_price, exit_price, quantity, profit_loss, return_pct, reason)
                     VALUES (%s, %s, %s, CURRENT_DATE, %s, %s, %s, %s, %s, %s)
-                """, (pos['ticker'], pos['strategy'], pos['entry_date'], pos['entry_price'], exit_price, pos['quantity'], profit, ret_pct, exit_reason))
+                """, (pos['ticker'], pos['strategy'], pos['entry_date'], entry_price, exit_price, pos['quantity'], profit, ret_pct, exit_reason))
                 
                 icon = "🟢" if profit > 0 else "🔴"
                 alerts.append(f"{icon} <b>EXIT EXECUTED: {ticker}</b>\nReason: {exit_reason}\nProfit/Loss: ₹{profit:.2f} ({ret_pct:.2f}%)")
             else:
-                # Increment bars held
                 cur.execute("UPDATE positions SET bars_held = bars_held + 1 WHERE id = %s;", (pos['id'],))
         except Exception as e:
             print(f"Error checking exit for {ticker}: {e}")
@@ -284,7 +296,6 @@ def check_exits():
 # ==========================================
 @app.get("/generate_entries")
 def generate_entries():
-    # 1. Fetch live active positions to exclude them
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT ticker FROM positions WHERE status = 'active';")
@@ -294,7 +305,6 @@ def generate_entries():
     portfolio = cur.fetchone()
     conn.close()
     
-    # 2. Market Regime
     nifty = yf.download('^NSEI', period='1y', progress=False)
     if isinstance(nifty.columns, pd.MultiIndex):
         nifty.columns = nifty.columns.get_level_values(0)
@@ -309,7 +319,6 @@ def generate_entries():
     elif latest_nifty['Close'] < latest_nifty['SMA_50'] and latest_nifty['SMA_50'] < latest_nifty['SMA_200']:
         regime = "Bearish"
 
-    # 3. Scanning logic
     live_signals = []
     for ticker in NIFTY_100_TICKERS:
         if ticker in active_tickers:
@@ -329,14 +338,12 @@ def generate_entries():
             df['ATR_14'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
             df.bfill(inplace=True)
             
-            # RSI Pullback
             in_uptrend = df['Close'] > df['SMA_50']
             rsi_dipped = (df['RSI_14'].shift(1) >= 35) & (df['RSI_14'].shift(1) <= 52)
             rsi_bouncing = df['RSI_14'] > (df['RSI_14'].shift(1) + 2)
             vol_conf = df['Volume'] > df['Vol_SMA_20']
             signal_pullback = in_uptrend & rsi_dipped & rsi_bouncing & vol_conf
             
-            # SMA44 Pullback
             major_uptrend = df['Close'].shift(1) > df['SMA_200'].shift(1)
             near_sma44 = (abs(df['Close'].shift(1) - df['SMA_44'].shift(1)) / df['SMA_44'].shift(1)) < 0.03
             bounce = (df['Close'] > df['SMA_44']) & (df['Close'].shift(1) <= (df['SMA_44'].shift(1) * 1.01))
@@ -353,15 +360,12 @@ def generate_entries():
         except Exception as e:
             print(f"Error scanning {ticker}: {e}")
 
-    # 4. Format & Send Telegram Alert
     if not live_signals:
         send_telegram_alert(f"📊 Market Regime: {regime}\nNo new actionable signals today.")
         return {"status": "no signals"}
         
     live_signals.sort(key=lambda x: x['RSI'])
-    
-    # Capital calculation logic (10% per trade)
-    capital_per_trade = portfolio['total_capital'] * 0.10
+    capital_per_trade = float(portfolio['total_capital']) * 0.10
     
     msg = f"🚨 <b>ACTIONABLE SIGNALS FOR TOMORROW</b> 🚨\n"
     msg += f"📊 <b>Regime:</b> {regime.upper()}\n"
